@@ -78,7 +78,138 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
     obj.onDebugMessage = null;
     obj.onTouchEnabledChanged = null;
     obj.onDisplayinfo = null;
+    obj.onAudioStateChanged = null;
     obj.accumulator = null;
+
+    obj.audio = {
+        supported: false,
+        state: 'stopped',
+        enabled: false,
+        caps: null,
+        ctx: null,
+        gain: null,
+        nextPlayTime: 0,
+        lastTimestamp: null,
+        lastSeq: null,
+        capsRequested: false
+    };
+    obj.AudioCommands = { CAPS: 90, START: 91, STOP: 92, FRAME: 93 };
+    function logAudio(msg, detail) {
+        try { console.log('[DeskAudio]', msg, detail || ''); } catch (ex) { }
+    }
+    function setAudioState(state, detail) {
+        obj.audio.state = state;
+        logAudio('state', state);
+        if (obj.onAudioStateChanged) { obj.onAudioStateChanged(state, detail); }
+    }
+    function resetAudio(hard) {
+        logAudio('reset', { hard: hard });
+        obj.audio.enabled = false;
+        obj.audio.nextPlayTime = 0;
+        obj.audio.lastTimestamp = null;
+        obj.audio.lastSeq = null;
+        setAudioState('stopped');
+        if (hard === true && obj.audio.ctx) {
+            try { obj.audio.ctx.close(); } catch (ex) { }
+            obj.audio.ctx = null;
+            obj.audio.gain = null;
+        }
+        if (hard === true) {
+            obj.audio.capsRequested = false;
+            obj.audio.supported = false;
+            obj.audio.caps = null;
+        }
+    }
+    async function ensureAudioContext() {
+        if (!obj.audio.ctx) {
+            var Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) { return null; }
+            obj.audio.ctx = new Ctx({ latencyHint: 'interactive' });
+            obj.audio.gain = obj.audio.ctx.createGain();
+            obj.audio.gain.gain.value = 1.0;
+            obj.audio.gain.connect(obj.audio.ctx.destination);
+            obj.audio.nextPlayTime = obj.audio.ctx.currentTime;
+        }
+        if (obj.audio.ctx.state === 'suspended') {
+            try { await obj.audio.ctx.resume(); } catch (ex) { }
+        }
+        return obj.audio.ctx;
+    }
+    obj.requestAudioCaps = function () {
+        if (obj.State != 3 || obj.audio.capsRequested === true) return;
+        obj.audio.capsRequested = true;
+        logAudio('request caps');
+        obj.send(String.fromCharCode(0x00, obj.AudioCommands.CAPS, 0x00, 0x04));
+    }
+    obj.startAudio = async function () {
+        if (obj.State != 3) return;
+        var ctx = await ensureAudioContext();
+        if (ctx == null) return;
+        obj.audio.enabled = true;
+        obj.audio.nextPlayTime = Math.max(ctx.currentTime, obj.audio.nextPlayTime || ctx.currentTime);
+        setAudioState('starting');
+        logAudio('start');
+        obj.send(String.fromCharCode(0x00, obj.AudioCommands.START, 0x00, 0x04));
+    }
+    obj.stopAudio = function (hard) {
+        if (obj.State != 3 && hard !== true) { return; }
+        logAudio('stop', { hard: hard });
+        obj.send(String.fromCharCode(0x00, obj.AudioCommands.STOP, 0x00, 0x04));
+        resetAudio(hard === true);
+    }
+    function handleAudioCaps(view) {
+        if (view.length < 10) return;
+        obj.audio.supported = true;
+        obj.audio.caps = {
+            codec: (view[4] << 8) + view[5],
+            sampleRate: (view[6] << 8) + view[7],
+            channels: (view[8] << 8) + view[9]
+        };
+        logAudio('caps', obj.audio.caps);
+        setAudioState(obj.audio.enabled ? obj.audio.state : 'supported', obj.audio.caps);
+    }
+    async function handleAudioFrame(view) {
+        if (obj.audio.enabled !== true) return;
+        logAudio('frame', { bytes: view.length });
+        var ctx = await ensureAudioContext();
+        if (ctx == null) return;
+        var dv = new DataView(view.buffer, view.byteOffset, view.byteLength);
+        var codec = dv.getUint8(4);
+        var channels = dv.getUint8(5);
+        var sampleRate = dv.getUint16(6, false);
+        var timestamp = dv.getUint32(8, false);
+        var seq = dv.getUint16(12, false);
+        if (codec !== 1 || channels === 0) return;
+        var offset = 14;
+        var pcmBytes = view.length - offset;
+        if (pcmBytes <= 0 || (pcmBytes % (channels * 2)) !== 0) return;
+        var frameCount = pcmBytes / 2 / channels;
+        var buffer = ctx.createBuffer(channels, frameCount, sampleRate || ctx.sampleRate);
+        var channelData = [];
+        for (var c = 0; c < channels; c++) { channelData[c] = buffer.getChannelData(c); }
+        var pos = offset;
+        for (var i = 0; i < frameCount; i++) {
+            for (var c2 = 0; c2 < channels; c2++) {
+                channelData[c2][i] = dv.getInt16(pos, true) / 32768;
+                pos += 2;
+            }
+        }
+        var driftReset = false;
+        if (obj.audio.lastTimestamp != null) {
+            var expected = obj.audio.lastTimestamp + Math.floor((frameCount * 1000) / (sampleRate || 48000));
+            var delta = timestamp - expected;
+            if (Math.abs(delta) > 200) { obj.audio.nextPlayTime = ctx.currentTime + 0.05; driftReset = true; }
+        }
+        obj.audio.lastTimestamp = timestamp;
+        obj.audio.lastSeq = seq;
+        var startAt = Math.max(ctx.currentTime + 0.02, obj.audio.nextPlayTime || ctx.currentTime);
+        var source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(obj.audio.gain || ctx.destination);
+        try { source.start(startAt); } catch (ex) { return; }
+        obj.audio.nextPlayTime = startAt + buffer.duration;
+        if (obj.audio.state !== 'playing') { setAudioState('playing', { driftReset: driftReset }); }
+    }
 
     var xMouseCursorActive = true;
     var xMouseCursorCurrent = 'default';
@@ -88,6 +219,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
     obj.Start = function () {
         obj.State = 0;
         obj.accumulator = null;
+        resetAudio(true);
     }
 
     obj.Stop = function () {
@@ -95,6 +227,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
         obj.UnGrabKeyInput();
         obj.UnGrabMouseInput();
         obj.touchenabled = 0;
+        resetAudio(true);
         if (obj.onScreenSizeChange != null) { obj.onScreenSizeChange(obj, obj.ScreenWidth, obj.ScreenHeight, obj.CanvasId); }
         obj.Canvas.clearRect(0, 0, obj.CanvasId.width, obj.CanvasId.height);
     }
@@ -314,13 +447,28 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
                 xMouseCursorCurrent = mouseCursors[cursorNum];
                 if (xMouseCursorActive) { obj.CanvasId.style.cursor = xMouseCursorCurrent; }
                 break;
+            case 90: // MNG_KVM_AUDIO_CAPS
+                handleAudioCaps(view);
+                break;
+            case 91: // MNG_KVM_AUDIO_START (status)
+                if (cmdsize >= 5) {
+                    if (view[4] === 0) { setAudioState('starting'); }
+                    else { obj.audio.enabled = false; setAudioState('error', { status: view[4] }); }
+                }
+                break;
+            case 92: // MNG_KVM_AUDIO_STOP (status)
+                resetAudio(false);
+                break;
+            case 93: // MNG_KVM_AUDIO_FRAME
+                handleAudioFrame(view);
+                break;
             default:
                 console.log('Unknown command', cmd, cmdsize);
                 break;
         }
 
     }
-    
+
     // Keyboard and Mouse I/O.
     obj.MouseButton = { "NONE": 0x00, "LEFT": 0x02, "RIGHT": 0x08, "MIDDLE": 0x20 };
     obj.KeyAction = { "NONE": 0, "DOWN": 1, "UP": 2, "SCROLL": 3, "EXUP": 4, "EXDOWN": 5, "DBLCLICK": 6 };
@@ -415,13 +563,13 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
         var extendedKey = false; // Test feature, add ?extkeys=1 to url to use.
 
         if ((obj.UseExtendedKeyFlag || (urlargs.extkeys == 1)) && (typeof event.code == 'string') && (event.code.startsWith('Arrow') || (extendedKeyTable.indexOf(event.code) >= 0))) {
-            extendedKey = true; 
+            extendedKey = true;
         }
 
         if (obj.isWindowsBrowser) {
-            if( obj.checkAltGr(obj, event, action) ) {
-              return;
-            }; 
+            if (obj.checkAltGr(obj, event, action)) {
+                return;
+            };
         }
 
         if ((extendedKey == false) && event.code && (event.code.startsWith('NumPad') == false) && (obj.localKeyMap == false)) {
@@ -453,21 +601,21 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
             obj._altGrArmed = false;
             clearTimeout(obj._altGrTimeout);
 
-            if ((event.code === "AltRight") &&  ((event.timeStamp - obj._altGrCtrlTime) < 50)) {
+            if ((event.code === "AltRight") && ((event.timeStamp - obj._altGrCtrlTime) < 50)) {
                 //AltGr detected.
-                obj.SendKeyMsgKC( action, AltGrKc, false);
+                obj.SendKeyMsgKC(action, AltGrKc, false);
                 return true;
-            } 
+            }
         }
 
         // Possible start of AltGr sequence? 
         if ((event.code === "ControlLeft") && !(ControlLeftKc in obj.pressedKeys)) {
-          obj._altGrArmed = true;
+            obj._altGrArmed = true;
             obj._altGrCtrlTime = event.timeStamp;
-          if( action == 1 ) {
-            obj._altGrTimeout = setTimeout(obj._handleAltGrTimeout.bind(obj), 100);
-            return true;
-          }
+            if (action == 1) {
+                obj._altGrTimeout = setTimeout(obj._handleAltGrTimeout.bind(obj), 100);
+                return true;
+            }
         }
         return false;
     }
@@ -475,7 +623,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
     obj._handleAltGrTimeout = function () { //Windows and no Ctrl+Alt -> send only Ctrl.
         obj._altGrArmed = false;
         clearTimeout(obj._altGrTimeout);
-        obj.SendKeyMsgKC( 1, ControlLeftKc, false); // (KeyDown, "ControlLeft", false)
+        obj.SendKeyMsgKC(1, ControlLeftKc, false); // (KeyDown, "ControlLeft", false)
     }
 
     // Send remote input lock. 0 = Unlock, 1 = Lock, 2 = Query
@@ -517,7 +665,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
         obj.send(String.fromCharCode(0x00, obj.InputType.KEYUNICODE, 0x00, 0x07, (action - 1)) + ShortToStr(val));
     }
 
-    obj.sendcad = function() { obj.SendCtrlAltDelMsg(); }
+    obj.sendcad = function () { obj.SendCtrlAltDelMsg(); }
 
     obj.SendCtrlAltDelMsg = function () {
         if (obj.State == 3) { obj.send(String.fromCharCode(0x00, obj.InputType.CTRLALTDEL, 0x00, 0x04)); }
@@ -717,7 +865,7 @@ var CreateAgentRemoteDesktop = function (canvasid, scrolldiv) {
             }
             else if (evt.type == 'MSPointerUp') flags = 0x00040000; // POINTER_FLAG_UP
 
-            if (!obj.TouchArray[id]) obj.TouchArray[id] = { x: X, y : Y };
+            if (!obj.TouchArray[id]) obj.TouchArray[id] = { x: X, y: Y };
             obj.SendTouchMsg2(id, flags)
             if (evt.type == 'MSPointerUp') delete obj.TouchArray[id];
         } else {
